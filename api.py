@@ -1,9 +1,10 @@
 import os
 import logging
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -49,7 +50,65 @@ MAX_NUM_FRAMES = 257
 USE_BFLOAT16 = os.getenv("USE_BFLOAT16", "true").lower() == "true"
 
 # Download configuration
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))  # Number of parallel workers for downloading
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
+
+# Metadata storage configuration
+METADATA_FILE = os.getenv("METADATA_FILE", "metadata.json")
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
+
+class VideoMetadata(BaseModel):
+    """Model for video metadata"""
+    id: str
+    filename: str
+    date_created: str
+    prompt: str
+    generation_type: str  # 'text-to-video' or 'image-to-video'
+    parameters: Dict[str, Any]
+    file_path: str
+
+def load_metadata() -> Dict[str, VideoMetadata]:
+    """Load metadata from file"""
+    try:
+        if os.path.exists(METADATA_FILE):
+            with open(METADATA_FILE, 'r') as f:
+                data = json.load(f)
+                return {k: VideoMetadata(**v) for k, v in data.items()}
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading metadata: {str(e)}")
+        return {}
+
+def save_metadata(metadata: Dict[str, VideoMetadata]):
+    """Save metadata to file"""
+    try:
+        with open(METADATA_FILE, 'w') as f:
+            json.dump({k: v.dict() for k, v in metadata.items()}, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving metadata: {str(e)}")
+
+def add_video_metadata(
+    filename: str,
+    prompt: str,
+    generation_type: str,
+    parameters: Dict[str, Any],
+    file_path: str
+) -> str:
+    """Add new video metadata and return video ID"""
+    metadata = load_metadata()
+    video_id = f"{len(metadata):06d}"
+    
+    metadata[video_id] = VideoMetadata(
+        id=video_id,
+        filename=filename,
+        date_created=datetime.now().isoformat(),
+        prompt=prompt,
+        generation_type=generation_type,
+        parameters=parameters,
+        file_path=file_path
+    )
+    
+    save_metadata(metadata)
+    return video_id
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,9 +131,9 @@ async def lifespan(app: FastAPI):
                 local_dir=str(ckpt_dir),
                 local_dir_use_symlinks=False,
                 repo_type='model',
-                max_workers=MAX_WORKERS,  # Enable parallel downloading
-                resume_download=True,     # Resume interrupted downloads
-                etag_timeout=30          # Increase timeout for better stability
+                max_workers=MAX_WORKERS,
+                resume_download=True,
+                etag_timeout=30
             )
             logger.info("Model download completed successfully")
         
@@ -83,7 +142,7 @@ async def lifespan(app: FastAPI):
         scheduler_dir = ckpt_dir / "scheduler"
 
         logger.info("Loading VAE model...")
-        vae = load_vae(vae_dir)  # This will load VAE in bfloat16
+        vae = load_vae(vae_dir)
         
         logger.info("Loading UNet model...")
         unet = load_unet(unet_dir)
@@ -108,8 +167,6 @@ async def lifespan(app: FastAPI):
             subfolder="tokenizer"
         )
 
-        # Initialize pipeline
-        logger.info("Initializing LTX Video pipeline...")
         pipeline = LTXVideoPipeline(
             transformer=unet,
             patchifier=patchifier,
@@ -123,7 +180,6 @@ async def lifespan(app: FastAPI):
             pipeline = pipeline.to("cuda")
             logger.info("Pipeline moved to CUDA")
             
-        # Initialize generator
         generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu")
         
         logger.info("Server startup complete!")
@@ -134,11 +190,9 @@ async def lifespan(app: FastAPI):
         logger.error(f"Error loading models: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to load models: {str(e)}")
     finally:
-        # Cleanup resources if needed
         pipeline = None
         generator = None
 
-# Create FastAPI app with lifespan
 app = FastAPI(
     title="LTX Video Generation API",
     description="API for generating videos using LTX-Video model",
@@ -224,27 +278,64 @@ async def health_check() -> Dict[str, Any]:
         "using_bfloat16": USE_BFLOAT16
     }
 
+@app.get("/videos")
+async def list_videos(
+    date: Optional[str] = None,
+    generation_type: Optional[str] = None
+) -> List[VideoMetadata]:
+    """List all generated videos with optional date and type filters"""
+    metadata = load_metadata()
+    videos = list(metadata.values())
+    
+    if date:
+        videos = [v for v in videos if v.date_created.startswith(date)]
+    if generation_type:
+        videos = [v for v in videos if v.generation_type == generation_type]
+        
+    return videos
+
+@app.get("/videos/{video_id}")
+async def get_video(video_id: str) -> VideoMetadata:
+    """Get metadata for a specific video"""
+    metadata = load_metadata()
+    if video_id not in metadata:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return metadata[video_id]
+
+@app.get("/videos/{video_id}/download")
+async def download_video(video_id: str):
+    """Download a specific video"""
+    metadata = load_metadata()
+    if video_id not in metadata:
+        raise HTTPException(status_code=404, detail="Video not found")
+        
+    video_path = metadata[video_id].file_path
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+        
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        filename=metadata[video_id].filename
+    )
+
 @app.post("/generate/text-to-video")
 async def generate_text_to_video(params: GenerationParams):
     """Generate video from text prompt"""
     try:
         logger.info(f"Starting text-to-video generation with prompt: {params.prompt}")
         
-        # Validate dimensions
         validate_dimensions(params.height, params.width, params.num_frames)
         
-        # Set seed
         seed_everething(params.seed)
         generator.manual_seed(params.seed)
         
-        # Calculate padded dimensions
         height_padded = ((params.height - 1) // 32 + 1) * 32
         width_padded = ((params.width - 1) // 32 + 1) * 32
         num_frames_padded = ((params.num_frames - 2) // 8 + 1) * 8 + 1
         
         logger.info(f"Using padded dimensions: {height_padded}x{width_padded}x{num_frames_padded}")
         
-        # Prepare input
         sample = {
             "prompt": params.prompt,
             "prompt_attention_mask": None,
@@ -253,7 +344,6 @@ async def generate_text_to_video(params: GenerationParams):
             "media_items": None,
         }
 
-        # Generate video
         logger.info("Generating video...")
         images = pipeline(
             num_inference_steps=params.num_inference_steps,
@@ -273,15 +363,12 @@ async def generate_text_to_video(params: GenerationParams):
             mixed_precision=params.use_mixed_precision,
         ).images
 
-        # Save video
-        output_dir = Path.cwd() / os.getenv("OUTPUT_DIR", "outputs").lstrip("./") / datetime.today().strftime('%Y-%m-%d')
+        output_dir = OUTPUT_DIR / datetime.today().strftime('%Y-%m-%d')
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Process video frames
         video_np = images[0].permute(1, 2, 3, 0).cpu().float().numpy()
         video_np = (video_np * 255).astype(np.uint8)
         
-        # Get output filename
         output_filename = get_unique_filename(
             "text_to_vid_0",
             ".mp4",
@@ -291,16 +378,25 @@ async def generate_text_to_video(params: GenerationParams):
             dir=output_dir
         )
 
-        # Write video file
         logger.info(f"Saving video to {output_filename}")
         with imageio.get_writer(output_filename, fps=params.frame_rate) as video:
             for frame in video_np:
                 video.append_data(frame)
                 
+        # Add metadata
+        video_id = add_video_metadata(
+            filename=output_filename.name,
+            prompt=params.prompt,
+            generation_type="text-to-video",
+            parameters=params.dict(),
+            file_path=str(output_filename)
+        )
+                
         return FileResponse(
             output_filename,
             media_type="video/mp4",
-            filename=output_filename.name
+            filename=output_filename.name,
+            headers={"X-Video-ID": video_id}
         )
 
     except Exception as e:
@@ -316,10 +412,8 @@ async def generate_image_to_video(
     try:
         logger.info(f"Starting image-to-video generation with prompt: {params.prompt}")
         
-        # Validate dimensions
         validate_dimensions(params.height, params.width, params.num_frames)
         
-        # Save uploaded image temporarily
         temp_image_path = f"temp_{file.filename}"
         try:
             with open(temp_image_path, "wb") as buffer:
@@ -327,28 +421,23 @@ async def generate_image_to_video(
                 buffer.write(content)
             
             logger.info("Processing input image...")
-            # Load and process image
             media_items_prepad = load_image_to_tensor_with_resize_and_crop(
                 temp_image_path, 
                 params.height, 
                 params.width
             )
         finally:
-            # Clean up temporary file
             if os.path.exists(temp_image_path):
                 os.remove(temp_image_path)
         
-        # Calculate padded dimensions
         height_padded = ((params.height - 1) // 32 + 1) * 32
         width_padded = ((params.width - 1) // 32 + 1) * 32
         num_frames_padded = ((params.num_frames - 2) // 8 + 1) * 8 + 1
         
         logger.info(f"Using padded dimensions: {height_padded}x{width_padded}x{num_frames_padded}")
         
-        # Calculate padding
         padding = calculate_padding(params.height, params.width, height_padded, width_padded)
         
-        # Apply padding to media items
         media_items = torch.nn.functional.pad(
             media_items_prepad, 
             padding, 
@@ -356,11 +445,9 @@ async def generate_image_to_video(
             value=-1
         )
 
-        # Set seed
         seed_everething(params.seed)
         generator.manual_seed(params.seed)
         
-        # Prepare input
         sample = {
             "prompt": params.prompt,
             "prompt_attention_mask": None,
@@ -369,7 +456,6 @@ async def generate_image_to_video(
             "media_items": media_items,
         }
 
-        # Generate video
         logger.info("Generating video...")
         images = pipeline(
             num_inference_steps=params.num_inference_steps,
@@ -389,15 +475,12 @@ async def generate_image_to_video(
             mixed_precision=params.use_mixed_precision,
         ).images
 
-        # Save video
-        output_dir = Path.cwd() / os.getenv("OUTPUT_DIR", "outputs").lstrip("./") / datetime.today().strftime('%Y-%m-%d')
+        output_dir = OUTPUT_DIR / datetime.today().strftime('%Y-%m-%d')
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Process video frames
         video_np = images[0].permute(1, 2, 3, 0).cpu().float().numpy()
         video_np = (video_np * 255).astype(np.uint8)
         
-        # Get output filename
         output_filename = get_unique_filename(
             "img_to_vid_0",
             ".mp4",
@@ -407,16 +490,25 @@ async def generate_image_to_video(
             dir=output_dir
         )
 
-        # Write video file
         logger.info(f"Saving video to {output_filename}")
         with imageio.get_writer(output_filename, fps=params.frame_rate) as video:
             for frame in video_np:
                 video.append_data(frame)
                 
+        # Add metadata
+        video_id = add_video_metadata(
+            filename=output_filename.name,
+            prompt=params.prompt,
+            generation_type="image-to-video",
+            parameters=params.dict(),
+            file_path=str(output_filename)
+        )
+                
         return FileResponse(
             output_filename,
             media_type="video/mp4",
-            filename=output_filename.name
+            filename=output_filename.name,
+            headers={"X-Video-ID": video_id}
         )
 
     except Exception as e:
