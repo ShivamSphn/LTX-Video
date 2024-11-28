@@ -49,6 +49,10 @@ MAX_NUM_FRAMES = 257
 # Model precision configuration
 USE_BFLOAT16 = os.getenv("USE_BFLOAT16", "true").lower() == "true"
 
+# Torch compile configuration
+ENABLE_TORCH_COMPILE = os.getenv("ENABLE_TORCH_COMPILE", "false").lower() == "true"
+TORCH_COMPILE_MODE = os.getenv("TORCH_COMPILE_MODE", "default")
+
 # Download configuration
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
 
@@ -166,6 +170,26 @@ async def lifespan(app: FastAPI):
             "PixArt-alpha/PixArt-XL-2-1024-MS",
             subfolder="tokenizer"
         )
+
+        # Optional torch compilation
+        if ENABLE_TORCH_COMPILE:
+            logger.info(f"Applying torch.compile with mode: {TORCH_COMPILE_MODE}")
+            try:
+                if TORCH_COMPILE_MODE == "reduce-overhead":
+                    unet = torch.compile(unet, mode="reduce-overhead")
+                    vae = torch.compile(vae, mode="reduce-overhead")
+                    text_encoder = torch.compile(text_encoder, mode="reduce-overhead")
+                elif TORCH_COMPILE_MODE == "max-autotune":
+                    unet = torch.compile(unet, mode="max-autotune")
+                    vae = torch.compile(vae, mode="max-autotune")
+                    text_encoder = torch.compile(text_encoder, mode="max-autotune")
+                else:  # default mode
+                    unet = torch.compile(unet)
+                    vae = torch.compile(vae)
+                    text_encoder = torch.compile(text_encoder)
+                logger.info("Torch compilation successful")
+            except Exception as compile_error:
+                logger.warning(f"Torch compilation failed: {compile_error}")
 
         pipeline = LTXVideoPipeline(
             transformer=unet,
